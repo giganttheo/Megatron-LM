@@ -3,6 +3,7 @@
 import logging
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -450,7 +451,60 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
+            # Token Superposition Training: input_ids is 3D (bs, seq/S, S)
+            # when superposition is active. Average S embeddings into one.
+            S = self.config.superposition_factor
+            if S > 1 and input_ids.dim() == 3:
+                # Position embeddings only applied once (to slot 0) since
+                # all S tokens share the same compressed position.
+                bs, sp_seq, _ = input_ids.shape
+                # Do S local embedding lookups, sum the partial (pre-all-reduce)
+                # results BEFORE calling reduce_from_tensor_model_parallel_region.
+                # This keeps the all-reduce on (bs*sp_seq, hidden) = baseline size
+                # instead of (bs*sp_seq*S, hidden) = S× baseline.
+                from megatron.core.tensor_parallel.mappings import (
+                    reduce_from_tensor_model_parallel_region,
+                )
+                # Access the raw embedding weight (local shard)
+                emb_weight = self.embedding.word_embeddings.weight
+                tp_group = self.embedding.word_embeddings.tp_group
+                tp_size = tp_group.size()
+                vocab_start = self.embedding.word_embeddings.vocab_start_index
+                vocab_end = self.embedding.word_embeddings.vocab_end_index
+
+                emb_dtype = self.embedding.word_embeddings.weight.dtype
+                output_sum = None
+                for i in range(S):
+                    ids_i = input_ids[..., i]  # (bs, sp_seq)
+                    if tp_size > 1:
+                        input_mask = (ids_i < vocab_start) | (ids_i >= vocab_end)
+                        masked_input = ids_i.clone() - vocab_start
+                        masked_input[input_mask] = 0
+                        output_parallel = torch.nn.functional.embedding(masked_input, emb_weight)
+                        output_parallel[input_mask, :] = 0.0
+                    else:
+                        output_parallel = torch.nn.functional.embedding(ids_i, emb_weight)
+                    if output_sum is None:
+                        output_sum = output_parallel.float()
+                    else:
+                        output_sum = output_sum + output_parallel.float()
+
+                # Single all-reduce on the summed (bs*sp_seq, hidden) tensor
+                output_sum = output_sum.view(bs, sp_seq, -1)
+                if tp_size > 1:
+                    output_sum = reduce_from_tensor_model_parallel_region(output_sum, group=tp_group)
+                h = (output_sum / S)
+                # Add position embeddings
+                if self.embedding.add_position_embedding:
+                    pos_emb = self.embedding.position_embeddings(position_ids)
+                    h = h + pos_emb.float()
+                h = h.to(emb_dtype)
+                # Match the embedding module's output layout
+                if not self.embedding.reduce_scatter_embeddings:
+                    h = h.transpose(0, 1).contiguous()  # [s b h]
+                decoder_input = h
+            else:
+                decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
 
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations
@@ -621,3 +675,44 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+    def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
+        """Computes the LM loss, with optional Token Superposition support.
+
+        When superposition_factor S > 1, logits are (sp_seq, bs, vocab_shard)
+        and labels are (bs, full_seq) where full_seq = sp_seq * S. Each
+        compressed position t predicts S next-bag tokens. The loss is the
+        average of S independent cross-entropy calls (causal padding applied
+        so the last compressed position only predicts the valid tokens).
+
+        See torchtitan-tst reference: torchtitan/components/loss.py
+        """
+        S = self.config.superposition_factor
+        if S <= 1 or logits.dim() != 3:
+            return super().compute_language_model_loss(labels, logits)
+
+        sp_seq, bs, _ = logits.shape
+        full_seq = labels.shape[1]
+        # Only use superposition loss when shapes are consistent
+        if full_seq != sp_seq * S:
+            return super().compute_language_model_loss(labels, logits)
+
+        # labels: (bs, full_seq) — Megatron uses (bs, seq)
+        # Causal padding: pad right by S-1 with -100, slice from S-1, reshape
+        labels_padded = torch.nn.functional.pad(labels, (0, S - 1), value=-100)
+        labels_shifted = labels_padded[:, S - 1:]  # (bs, full_seq)
+        labels_shifted = labels_shifted.reshape(bs, sp_seq, S)
+
+        # Single vocab-wide softmax normalization shared across all S targets,
+        # instead of S full recomputations. vocab_parallel_cross_entropy's
+        # max/exp/sum passes and their all-reduces scale with vocab size
+        # (~50k) and were being repeated S times (S in the 6-16 range for
+        # typical TST configs) even though the normalization is identical
+        # across all S targets -- only the gather-at-target step differs.
+        # See vocab_parallel_cross_entropy_multi_target for details.
+        targets = labels_shifted.permute(2, 1, 0).contiguous()  # (S, sp_seq, bs)
+        mean_loss = tensor_parallel.vocab_parallel_cross_entropy_multi_target(
+            logits, targets, tp_group=self.tp_group
+        )  # (sp_seq, bs)
+
+        return mean_loss.transpose(0, 1).contiguous()  # (bs, sp_seq)

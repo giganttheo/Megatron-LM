@@ -180,6 +180,16 @@ def get_batch(data_iterator, vp_stage=None):
 SPIKY_LOSS_FACTOR = 10
 
 
+def _is_superposition_active():
+    """Check if the current iteration is in the superposition phase."""
+    args = get_args()
+    S = args.superposition_bag_size
+    if S <= 1 or args.superposition_ratio <= 0.0:
+        return False
+    sp_iters = int(args.superposition_ratio * args.train_iters)
+    return args.iteration < sp_iters
+
+
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
     logprobs_dir, decode_threads, prefetch_factor, msc_prefetch_depth, kd_loss_alpha, ignore_errors
@@ -231,6 +241,17 @@ def loss_func(
     elif has_nvidia_modelopt and getattr(args, 'modelopt_enabled', False):  # [ModelOpt]
         loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
     else:
+        # Token Superposition Training: when active, the model's
+        # compute_language_model_loss returns (bs, sp_seq) per-token losses
+        # but loss_mask is (bs, full_seq). Reshape loss_mask to match.
+        # Skip during eval (model.training is False).
+        if _is_superposition_active() and model is not None and model.training:
+            S = args.superposition_bag_size
+            bs, full_seq = loss_mask.shape
+            sp_seq = full_seq // S
+            # A superposition position is valid if ANY token in its bag is.
+            loss_mask = loss_mask.reshape(bs, sp_seq, S).any(dim=-1).float()
+
         losses = output_tensor.view(-1).float()
         loss_mask = loss_mask.view(-1).float()
         loss = torch.sum(losses * loss_mask)
@@ -279,6 +300,7 @@ def forward_step(data_iterator, model: HybridModel):
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
     """
+    args = get_args()
     timers = get_timers()
 
     # Get the batch.
@@ -324,6 +346,19 @@ def forward_step(data_iterator, model: HybridModel):
         )
 
     timers('batch-generator').stop()
+
+    # Token Superposition Training: only active during training (not eval).
+    # Eval always uses baseline seq_length with standard forward.
+    sp_active = _is_superposition_active() and model.training
+    if sp_active and tokens is not None:
+        S = args.superposition_bag_size
+        bs, full_seq = tokens.shape
+        tokens = tokens.reshape(bs, full_seq // S, S)
+        position_ids = position_ids[:, :full_seq // S]
+        model.config.superposition_factor = S
+        attention_mask = None
+    else:
+        model.config.superposition_factor = 1
 
     with stimer:
         output_tensor = model(

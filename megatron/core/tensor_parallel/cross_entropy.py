@@ -233,3 +233,164 @@ def vocab_parallel_cross_entropy(
     return _VocabParallelCrossEntropy.apply(
         vocab_parallel_logits, target, label_smoothing, tp_group
     )
+
+
+class _VocabParallelCrossEntropyMultiTarget(torch.autograd.Function):
+    """Cross entropy for S independent target sets sharing the SAME logits.
+
+    Used by Token Superposition Training: one set of logits predicts S
+    different next-bag tokens, and the loss is the mean of S independent
+    cross-entropy terms. The naive approach calls vocab_parallel_cross_entropy
+    S times, which recomputes the full O(seq*bs*vocab) softmax normalization
+    (max, exp, sum, and their all-reduces) S times even though it is
+    IDENTICAL across all S calls -- only the gather-at-target step differs.
+
+    This function computes the shared softmax normalization ONCE, then does
+    S cheap gather + tiny-all-reduce passes (O(seq*bs), independent of vocab
+    size) instead of S full vocab-wide passes. For vocab ~50k and S in the
+    6-16 range (typical TST configs), this removes the dominant remaining
+    per-iteration cost after the embedding/schedule fixes.
+    """
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits, targets, tp_group=None):
+        """
+        Args:
+            vocab_parallel_logits: [seq, bs, vocab_shard]
+            targets: [S, seq, bs] -- S separate target sets sharing the same logits
+            tp_group: tensor-parallel process group
+
+        Returns:
+            loss: [seq, bs] -- mean over S of per-target cross-entropy loss
+        """
+        if tp_group is None:
+            tp_group = get_tensor_model_parallel_group()
+
+        S = targets.shape[0]
+        assert S >= 1, "targets must have at least one target set along dim 0"
+
+        # --- Shared softmax normalization, computed ONCE ---
+        vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
+            vocab_parallel_logits
+        )
+        torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
+
+        # shifted logits, kept until all S gathers are done (see below), then
+        # exponentiated in place once no longer needed in pre-exp form.
+        vocab_parallel_logits -= logits_max.unsqueeze(dim=-1)
+        shifted_logits = vocab_parallel_logits
+
+        get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
+        partition_vocab_size = shifted_logits.size()[-1]
+        rank = get_pg_rank(tp_group)
+        world_size = get_pg_size(tp_group)
+        vocab_start_index, vocab_end_index = get_vocab_range(partition_vocab_size, rank, world_size)
+
+        logits_2d = shifted_logits.view(-1, partition_vocab_size)
+        arange_1d = torch.arange(start=0, end=logits_2d.size()[0], device=logits_2d.device)
+
+        seq, bs = targets.shape[1], targets.shape[2]
+
+        target_masks = torch.empty(
+            (S,) + targets.shape[1:], dtype=torch.bool, device=shifted_logits.device
+        )
+        masked_targets_1d = torch.empty(
+            (S, arange_1d.numel()), dtype=torch.long, device=shifted_logits.device
+        )
+        predicted_logits_all = torch.empty(
+            (S, seq, bs), dtype=torch.float32, device=shifted_logits.device
+        )
+
+        # Gather all S predicted (shifted) logits FIRST, while shifted_logits
+        # still holds pre-exp values -- O(S*seq*bs) gathers, NOT O(S*seq*bs*vocab).
+        for i in range(S):
+            target_i = targets[i]
+            target_mask = (target_i < vocab_start_index) | (target_i >= vocab_end_index)
+            masked_target = target_i.clone() - vocab_start_index
+            masked_target[target_mask] = 0
+            masked_target_1d = masked_target.view(-1)
+
+            predicted_1d = logits_2d[arange_1d, masked_target_1d].clone().contiguous()
+            predicted = predicted_1d.view_as(target_i)
+            predicted[target_mask] = 0.0
+
+            predicted_logits_all[i] = predicted
+            target_masks[i] = target_mask
+            masked_targets_1d[i] = masked_target_1d
+
+        # Single all-reduce covering all S predicted-logit tensors at once
+        # (stacked), instead of S separate all-reduces -- fewer, larger
+        # collectives are cheaper than many tiny ones.
+        torch.distributed.all_reduce(
+            predicted_logits_all, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+
+        # NOW exponentiate in place (shifted_logits no longer needed in
+        # pre-exp form) and compute the shared sum_exp / log_sum_exp ONCE.
+        exp_logits = shifted_logits
+        torch.exp(shifted_logits, out=exp_logits)
+        sum_exp_logits = exp_logits.sum(dim=-1)
+        torch.distributed.all_reduce(
+            sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
+        )
+        log_sum_exp_logits = torch.log(sum_exp_logits)  # [seq, bs], shared across S
+
+        total_loss = (log_sum_exp_logits.unsqueeze(0) - predicted_logits_all).sum(dim=0)
+        mean_loss = total_loss / S
+
+        # softmax = exp_logits / sum_exp_logits, used identically for all S in backward.
+        softmax = exp_logits.div_(sum_exp_logits.unsqueeze(dim=-1))
+
+        ctx.save_for_backward(softmax, target_masks, masked_targets_1d)
+        ctx.S = S
+        ctx.partition_vocab_size = partition_vocab_size
+
+        return mean_loss
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """
+        dL/dlogits = softmax - (1/S) * sum_i onehot(target_i, masked)
+
+        softmax is shared; we start from one copy of it and subtract 1/S at
+        each of the S (possibly overlapping) target positions -- S cheap
+        scatter ops on top of a single softmax tensor, no repeated exp/sum.
+        """
+        softmax, target_masks, masked_targets_1d = ctx.saved_tensors
+        S = ctx.S
+        partition_vocab_size = ctx.partition_vocab_size
+
+        grad_input = softmax  # reuse buffer, softmax not needed after this
+        grad_2d = grad_input.view(-1, partition_vocab_size)
+        arange_1d = torch.arange(start=0, end=grad_2d.size()[0], device=grad_2d.device)
+
+        inv_S = 1.0 / S
+        for i in range(S):
+            softmax_update = (1.0 - target_masks[i].view(-1).float()) * inv_S
+            grad_2d[arange_1d, masked_targets_1d[i]] -= softmax_update
+
+        grad_input.mul_(grad_output.unsqueeze(dim=-1))
+
+        return grad_input, None, None
+
+
+def vocab_parallel_cross_entropy_multi_target(
+    vocab_parallel_logits: torch.Tensor,
+    targets: torch.Tensor,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+) -> torch.Tensor:
+    """
+    Cross entropy loss for S independent target sets sharing the same logits,
+    e.g. Token Superposition Training where one compressed position predicts
+    S next-bag tokens. Computes the shared softmax normalization once instead
+    of S times -- see _VocabParallelCrossEntropyMultiTarget for details.
+
+    Args:
+        vocab_parallel_logits: [sequence_length, batch_size, vocab_size/num_parallel_ranks]
+        targets: [S, sequence_length, batch_size] -- S target sets
+        tp_group: the tensor parallel group over which to all reduce
+
+    Returns:
+        loss: [sequence_length, batch_size] -- mean over S of per-target CE loss
+    """
+    return _VocabParallelCrossEntropyMultiTarget.apply(vocab_parallel_logits, targets, tp_group)
