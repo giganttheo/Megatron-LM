@@ -1420,6 +1420,7 @@ def pretrain(
                 inference_model,
                 p2p_communicator=p2p_communicator,
                 schedule_pg_collection=schedule_pg_collection,
+                train_valid_test_dataset_provider=train_valid_test_dataset_provider,
             )
 
         print_datetime('after training is done')
@@ -2307,12 +2308,21 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        # Token Superposition Training: pass compressed seq_length to the
+        # schedule so P2P buffers and tensor shapes match the actual model
+        # input size (seq/S), not the expanded dataloader size (seq*S).
+        _tst_bag_size = getattr(args, 'superposition_bag_size', 1)
+        _tst_ratio = getattr(args, 'superposition_ratio', 0.0)
+        _tst_sp_iters = int(_tst_ratio * args.train_iters) if _tst_bag_size > 1 and _tst_ratio > 0 else 0
+        _tst_active = _tst_sp_iters > 0 and (iteration or 0) < _tst_sp_iters and (iteration or 0) >= 0
+        eff_seq_length = args.seq_length // _tst_bag_size if _tst_active else args.seq_length
+
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
+            seq_length=eff_seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
@@ -2560,6 +2570,16 @@ def training_log(
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
             wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
+            # Token Superposition Training: a "sample" covers seq_length * S
+            # tokens during the superposition phase vs seq_length tokens
+            # otherwise, so samples-vs-steps alone understates progress
+            # during/after an SP phase. Log the token-accurate counter
+            # alongside it (falls back to samples * current seq_length for
+            # runs where seq_length never varies, i.e. TST not in use).
+            consumed_train_tokens = getattr(
+                args, 'consumed_train_tokens', args.consumed_train_samples * args.seq_length
+            )
+            wandb_writer.log({'tokens vs steps': consumed_train_tokens}, iteration)
         if learning_rate is not None:
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar('learning-rate vs samples', learning_rate, args.consumed_train_samples)
@@ -2852,7 +2872,12 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
         num_floating_point_operations_so_far - start_num_floating_point_operations
     ) / (elapsed_time * 10**12 * args.world_size)
 
-    tokens_so_far = args.consumed_train_samples * args.seq_length
+    tokens_so_far = getattr(args, 'consumed_train_tokens', None)
+    if tokens_so_far is None:
+        # Fallback for checkpoints/resumes predating the token counter, or
+        # runs that never used a phase-varying seq_length (TST): sample count
+        # times current seq_length is exact in that case.
+        tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(
         args.save,
@@ -3210,6 +3235,7 @@ def train(
     inference_model=None,
     p2p_communicator: Optional[P2PCommunicator] = None,
     schedule_pg_collection: Optional[MultiModuleProcessGroupCollection] = None,
+    train_valid_test_dataset_provider=None,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
@@ -3555,7 +3581,43 @@ def train(
 
     # Run training iterations till done.
     buffered_rollouts = None
+
+    # Token Superposition Training: compute phase boundary.
+    _tst_bag_size = getattr(args, 'superposition_bag_size', 1)
+    _tst_ratio = getattr(args, 'superposition_ratio', 0.0)
+    _tst_sp_iters = int(_tst_ratio * args.train_iters) if _tst_bag_size > 1 and _tst_ratio > 0 else 0
+    _tst_base_seq_length = args.seq_length
+    _tst_in_superposition = False
+    if _tst_sp_iters > 0 and iteration < _tst_sp_iters:
+        # Start in superposition phase: expand seq_length for the dataloader.
+        args.seq_length = _tst_base_seq_length * _tst_bag_size
+        _tst_in_superposition = True
+        print_rank_0(f"[TST] Entering superposition phase at iteration {iteration}: "
+                     f"seq_length={args.seq_length} (bag_size={_tst_bag_size}), "
+                     f"phase ends at iteration {_tst_sp_iters}")
+        # Rebuild the train dataloader with the expanded seq_length.
+        if train_valid_test_dataset_provider is not None and not isinstance(train_data_iterator, list):
+            train_data_iterator = build_train_valid_test_data_iterators(
+                train_valid_test_dataset_provider
+            )[0]
+
     while iteration < args.train_iters:
+        # Token Superposition Training: handle phase transition.
+        if _tst_sp_iters > 0:
+            if iteration == _tst_sp_iters and _tst_in_superposition:
+                # Transition: superposition -> standard
+                args.seq_length = _tst_base_seq_length
+                _tst_in_superposition = False
+                if train_valid_test_dataset_provider is not None and not isinstance(train_data_iterator, list):
+                    print_rank_0(f"[TST] Transitioning to standard training at iteration {iteration}: "
+                                 f"seq_length={args.seq_length}")
+                    train_data_iterator = build_train_valid_test_data_iterators(
+                        train_valid_test_dataset_provider
+                    )[0]
+                else:
+                    print_rank_0(f"[TST] Transitioning to standard training at iteration {iteration}: "
+                                 f"seq_length={args.seq_length} (dataloader not rebuilt)")
+
         if (args.profile
             and (len(args.profile_ranks) == 0 or
                  torch.distributed.get_rank() in args.profile_ranks)):
@@ -3773,6 +3835,20 @@ def train(
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
+
+        # Token Superposition Training: consumed_train_samples counts
+        # sequences, but a "sequence" during the superposition phase covers
+        # seq_length * superposition_bag_size tokens (args.seq_length is
+        # temporarily expanded by the training loop during that phase),
+        # vs seq_length tokens per sequence outside it. Deriving total tokens
+        # as consumed_train_samples * args.seq_length after the fact is only
+        # correct if seq_length never changed across the run; track tokens
+        # incrementally instead, using the seq_length actually in effect for
+        # THIS iteration, so counts stay correct across the SP <-> standard
+        # phase transition.
+        args.consumed_train_tokens = (
+            getattr(args, 'consumed_train_tokens', 0) + iteration_sequences * args.seq_length
+        )
 
         # Use iteration_sequences as batch_size for floating point operations
         batch_size = iteration_sequences

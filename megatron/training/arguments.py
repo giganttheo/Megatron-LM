@@ -1269,6 +1269,37 @@ def validate_args(args, defaults={}):
         assert args.max_position_embeddings >= args.seq_length, \
             f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
             f"or equal to seq_length ({args.seq_length})."
+
+    # Token Superposition Training (TST) validation
+    if args.superposition_bag_size > 1:
+        assert args.seq_length is not None, \
+            "--superposition-bag-size requires --seq-length to be set."
+        # seq_length is the baseline (post-superposition) length. The dataloader
+        # produces seq_length * S tokens, which are then averaged into seq_length
+        # positions. Each bag of S tokens shares one position, so
+        # max_position_embeddings only needs to cover seq_length (already checked
+        # above). No additional constraint needed.
+        if args.create_attention_mask_in_dataloader:
+            # The dataloader-constructed attention mask is [seq_length, seq_length]
+            # (quadratic). During the superposition phase seq_length is expanded
+            # to seq_length * S for the dataloader, making the mask S^2 times
+            # bigger than baseline -- constructed AND broadcast to every TP rank
+            # every batch. This dwarfs every other TST cost (observed ~S^2x
+            # batch-generator time for S in the 6-16 range). The attention
+            # backend already defaults to a causal mask when none is supplied,
+            # so this explicit mask is unnecessary here; disable it automatically
+            # rather than requiring every TST user to discover this flag.
+            print_rank_0(
+                "[TST] --create-attention-mask-in-dataloader is incompatible with "
+                "token superposition (mask size scales with seq_length^2, and "
+                "seq_length is expanded by the bag size during the superposition "
+                "phase). Disabling it automatically; the attention backend will "
+                "use its default causal mask instead."
+            )
+            args.create_attention_mask_in_dataloader = False
+    assert 0.0 <= args.superposition_ratio <= 1.0, \
+        f"--superposition-ratio ({args.superposition_ratio}) must be in [0.0, 1.0]."
+
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
@@ -2974,6 +3005,19 @@ def _add_data_args(parser):
                        'generation of mock data when an implementation is available.')
     group.add_argument('--seq-length', type=int, default=None,
                        help='Maximum sequence length to process.')
+    group.add_argument('--superposition-bag-size', type=int, default=1,
+                       help='Token superposition bag size S. During the superposition '
+                            'phase, S consecutive tokens are averaged into one hidden, '
+                            'so the transformer runs on seq_length/S positions. The '
+                            'dataloader produces seq_length * S tokens so the '
+                            'superposed sequence matches the baseline length. '
+                            'Must divide seq_length.')
+    group.add_argument('--superposition-ratio', type=float, default=0.0,
+                       help='Fraction of total training iterations to run with '
+                            'token superposition (0.0 = none, 1.0 = entire run). '
+                            'The superposition phase occupies iterations '
+                            '1..floor(ratio * train_iters); the remainder runs '
+                            'standard training.')
     group.add_argument('--encoder-seq-length', type=int, default=None,
                        help='Maximum encoder sequence length to process.'
                        'This should be exclusive of --seq-length')

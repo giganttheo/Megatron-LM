@@ -101,6 +101,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of transformer layers on last pipeline stage.
     None implies equal layer division across PP ranks."""
 
+    superposition_factor: int = 1
+    """Token superposition bag size S (>1 enables TST). When active, S
+    consecutive token embeddings are averaged into one hidden state and
+    the transformer runs on seq_len/S positions. Set to 1 to disable.
+    Toggled at runtime by the training loop based on --superposition-ratio."""
+
     pipeline_model_parallel_layout: Optional[Union[str, list, PipelineParallelLayerLayout]] = None
     """Custom definition of the pipeline parallel partitioning.
     Support type:
