@@ -3609,6 +3609,42 @@ def train(
                 args.seq_length = _tst_base_seq_length
                 _tst_in_superposition = False
                 if train_valid_test_dataset_provider is not None and not isinstance(train_data_iterator, list):
+                    # BUG FIX: the rebuilt dataloader resumes from
+                    # `consumed_train_samples_in_current_phase`, which (absent
+                    # --phase-transition-iterations) falls back to plain
+                    # `args.consumed_train_samples` (see
+                    # get_train_valid_test_num_samples /
+                    # build_train_valid_test_data_loaders). That sample count
+                    # was produced under the EXPANDED superposition
+                    # sequence_length (seq_length * S), but the new dataset is
+                    # built with the baseline sequence_length -- so "sample
+                    # N" means a completely different, much earlier corpus
+                    # offset in the rebuilt dataset (same seed => identical
+                    # document permutation, different per-sample chunk size).
+                    # Net effect: phase 2 silently re-reads a large chunk of
+                    # data phase 1 already consumed. Convert the token-exact
+                    # counter (accumulated every iteration regardless of
+                    # which seq_length was in effect) into the sample count
+                    # that is correct for the NEW (baseline) seq_length
+                    # before rebuilding, so the resume offset lands at the
+                    # right token position instead of the right sample index
+                    # under the wrong sequence length.
+                    _tst_tokens_consumed = getattr(args, 'consumed_train_tokens', None)
+                    if _tst_tokens_consumed is not None:
+                        _tst_corrected_samples = _tst_tokens_consumed // args.seq_length
+                        print_rank_0(
+                            f"[TST] Correcting consumed_train_samples for seq_length change: "
+                            f"{args.consumed_train_samples} -> {_tst_corrected_samples} "
+                            f"(tokens_consumed={_tst_tokens_consumed}, new seq_length={args.seq_length})"
+                        )
+                        args.consumed_train_samples = _tst_corrected_samples
+                    else:
+                        print_rank_0(
+                            "[TST] WARNING: consumed_train_tokens not available at phase "
+                            "transition; dataloader resume offset may skip or repeat data "
+                            "since consumed_train_samples was computed under the expanded "
+                            "superposition seq_length."
+                        )
                     print_rank_0(f"[TST] Transitioning to standard training at iteration {iteration}: "
                                  f"seq_length={args.seq_length}")
                     train_data_iterator = build_train_valid_test_data_iterators(
