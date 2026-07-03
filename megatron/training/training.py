@@ -3592,6 +3592,15 @@ def train(
         # Start in superposition phase: expand seq_length for the dataloader.
         args.seq_length = _tst_base_seq_length * _tst_bag_size
         _tst_in_superposition = True
+        # The dataset built for the SP phase only needs to cover the SP
+        # phase's own iterations -- it gets rebuilt at the phase boundary
+        # anyway. Size it in SP-phase sample units (each sample already
+        # holds seq*S tokens) instead of the seq_length-blind
+        # train_iters * global_batch_size default, which would otherwise
+        # size it for the WHOLE run's iteration count while every sample is
+        # S times bigger than baseline -- oversized by ~S, wasting
+        # preprocessing time and disk, though not incorrect on its own.
+        args._tst_train_samples_override = _tst_sp_iters * args.global_batch_size
         print_rank_0(f"[TST] Entering superposition phase at iteration {iteration}: "
                      f"seq_length={args.seq_length} (bag_size={_tst_bag_size}), "
                      f"phase ends at iteration {_tst_sp_iters}")
@@ -3645,6 +3654,19 @@ def train(
                             "since consumed_train_samples was computed under the expanded "
                             "superposition seq_length."
                         )
+                    # The dense-phase dataset must be sized to cover the
+                    # remaining (train_iters - sp_iters) iterations at
+                    # baseline seq_length, in baseline-seq_length sample
+                    # units -- NOT the whole run's train_iters, which would
+                    # undersize it relative to how far consumed_train_samples
+                    # has already advanced (this is exactly what caused the
+                    # "no samples left to consume" crash: the dataset-size
+                    # formula and the resume-offset were computed in
+                    # inconsistent units).
+                    args._tst_train_samples_override = (
+                        args.consumed_train_samples
+                        + (args.train_iters - iteration) * args.global_batch_size
+                    )
                     print_rank_0(f"[TST] Transitioning to standard training at iteration {iteration}: "
                                  f"seq_length={args.seq_length}")
                     train_data_iterator = build_train_valid_test_data_iterators(
@@ -4405,6 +4427,20 @@ def get_train_valid_test_num_samples():
         train_samples = args.train_samples
     else:
         train_samples = args.train_iters * args.global_batch_size
+        # Token Superposition Training: train_iters * global_batch_size
+        # silently assumes a constant seq_length across the whole run. TST
+        # varies seq_length between the SP phase (seq*S per sample) and the
+        # dense phase (seq per sample), so the SAME sample count means a
+        # different number of tokens depending on which phase's dataset is
+        # being built. The TST phase-transition code (see train()) sets
+        # _tst_train_samples_override to the correct sample target -- in
+        # whichever seq_length units the dataset currently being built uses
+        # -- right before triggering a (re)build; consume it here instead of
+        # the seq_length-blind default so the dataset is sized to actually
+        # cover the phase(s) it needs to serve.
+        _tst_override = getattr(args, '_tst_train_samples_override', None)
+        if _tst_override is not None:
+            train_samples = _tst_override
     if args.full_validation:
         eval_samples = None
     else:
