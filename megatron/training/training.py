@@ -3931,6 +3931,37 @@ def train(
         total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
             consume_seqlen_stats_in_iteration()
         )
+        # Token Superposition Training: num_floating_point_operations' BSHD
+        # defaults (batch_size * args.seq_length, batch_size * args.seq_length^2)
+        # are meant to reflect the REAL model compute -- but during the SP
+        # phase args.seq_length holds the EXPANDED raw-token length (S x
+        # baseline), while the model's actual forward pass runs on the
+        # COMPRESSED sp_seq = args.seq_length // S positions (see forward_step's
+        # tokens.reshape(bs, full_seq // S, S)). Left uncorrected, every FLOPs/
+        # throughput/MFU number computed during SP would overcount by ~S
+        # (token-linear term) and ~S^2 (attention term), then discontinuously
+        # jump back to correct the moment the phase transitions -- exactly the
+        # kind of "metrics look inconsistent across the SP<->dense boundary"
+        # symptom this is fixing. Only applies to the BSHD fallback path
+        # (total_real_tokens_in_batch is None); THD/packed runs already get
+        # the real per-chunk token count from consume_seqlen_stats_in_iteration
+        # and are unaffected.
+        if total_real_tokens_in_batch is None:
+            _tst_bag_size_flops = getattr(args, 'superposition_bag_size', 1)
+            _tst_ratio_flops = getattr(args, 'superposition_ratio', 0.0)
+            _tst_sp_iters_flops = (
+                int(_tst_ratio_flops * args.train_iters)
+                if _tst_bag_size_flops > 1 and _tst_ratio_flops > 0 else 0
+            )
+            _tst_active_flops = (
+                _tst_sp_iters_flops > 0 and iteration < _tst_sp_iters_flops
+            )
+            if _tst_active_flops:
+                eff_seq_length_flops = args.seq_length // _tst_bag_size_flops
+                total_real_tokens_in_batch = batch_size * eff_seq_length_flops
+                seqlen_squared_sum_in_batch = (
+                    batch_size * eff_seq_length_flops * eff_seq_length_flops
+                )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
