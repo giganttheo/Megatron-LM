@@ -1932,6 +1932,18 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 )
             state_dict['args'].consumed_train_samples = target_iter * args.global_batch_size
             state_dict['args'].skipped_train_samples = 0
+            # Token Superposition Training: consumed_train_tokens must be
+            # rederived consistently with the overridden consumed_train_samples,
+            # otherwise the SP<->dense phase-transition resume-offset fix would
+            # read a stale token count that doesn't match the overridden
+            # iteration. Only exact for runs where seq_length is constant up to
+            # target_iter (i.e. target_iter is not itself mid-SP-phase with a
+            # varying seq_length) -- flag this rather than silently computing a
+            # wrong value for the harder case.
+            if hasattr(state_dict['args'], 'consumed_train_tokens'):
+                state_dict['args'].consumed_train_tokens = (
+                    target_iter * args.global_batch_size * args.seq_length
+                )
         print_rank_0(f'Overriding checkpoint iteration to {target_iter} '
                      f'(consumed_train_samples = {target_iter * args.global_batch_size})')
 
@@ -1969,6 +1981,22 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         update_num_microbatches(consumed_samples=args.consumed_train_samples, verbose=True)
         args.consumed_valid_samples = getattr(checkpoint_args,
                                               'consumed_valid_samples', 0)
+        # Token Superposition Training: consumed_train_tokens is the
+        # token-exact counter (accumulated every iteration using whichever
+        # seq_length was actually in effect that iteration -- see its
+        # accumulation site elsewhere in this file) that TST's SP<->dense
+        # phase-transition logic uses to compute the correct dataloader
+        # resume offset when the seq_length changes between phases. It was
+        # never restored here, so any run that crashes/restarts WHILE
+        # STILL IN the SP phase and later reaches the real phase transition
+        # in the same continued run would use an under-counted value (reset
+        # to 0 at process start, only accumulating post-restart) instead of
+        # the true cumulative count -- causing the transition to resume the
+        # dense-phase dataloader too early and re-read data already seen
+        # right before the crash. Restore it the same way as the other
+        # consumed_* counters so it survives a checkpoint resume correctly.
+        if hasattr(checkpoint_args, 'consumed_train_tokens'):
+            args.consumed_train_tokens = checkpoint_args.consumed_train_tokens
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
 
