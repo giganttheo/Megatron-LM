@@ -703,16 +703,28 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         labels_shifted = labels_padded[:, S - 1:]  # (bs, full_seq)
         labels_shifted = labels_shifted.reshape(bs, sp_seq, S)
 
-        # Single vocab-wide softmax normalization shared across all S targets,
-        # instead of S full recomputations. vocab_parallel_cross_entropy's
-        # max/exp/sum passes and their all-reduces scale with vocab size
-        # (~50k) and were being repeated S times (S in the 6-16 range for
-        # typical TST configs) even though the normalization is identical
-        # across all S targets -- only the gather-at-target step differs.
-        # See vocab_parallel_cross_entropy_multi_target for details.
-        targets = labels_shifted.permute(2, 1, 0).contiguous()  # (S, sp_seq, bs)
-        mean_loss = tensor_parallel.vocab_parallel_cross_entropy_multi_target(
-            logits, targets, tp_group=self.tp_group
-        )  # (sp_seq, bs)
+        # Plain S-loop over standard vocab_parallel_cross_entropy, matching
+        # the torchtitan-tst reference (Listing 3: loop over the bag,
+        # standard per-target cross_entropy, mean over S) byte-for-byte in
+        # terms of the operations performed. This is intentionally NOT the
+        # shared-softmax vocab_parallel_cross_entropy_multi_target
+        # optimization (previously used here) -- that version was verified
+        # gradient-identical to this loop in an isolated single-process
+        # harness, but a live/full-scale training run exercises FSDP + TP +
+        # autograd interactions the isolated harness didn't cover, so we
+        # revert to the simple, reference-identical loop here while
+        # investigating why TST underperforms baseline in Megatron, to rule
+        # out any side effect from the optimization. See
+        # vocab_parallel_cross_entropy_multi_target in
+        # megatron/core/tensor_parallel/cross_entropy.py for the (still
+        # available, currently unused here) optimized version.
+        total_loss = torch.zeros(bs, sp_seq, device=logits.device, dtype=torch.float32)
+        for i in range(S):
+            lbl_i = labels_shifted[:, :, i]  # (bs, sp_seq)
+            lbl_i = lbl_i.transpose(0, 1).contiguous()  # (sp_seq, bs)
+            loss_i = tensor_parallel.vocab_parallel_cross_entropy(
+                logits, lbl_i, tp_group=self.tp_group
+            )  # (sp_seq, bs)
+            total_loss = total_loss + loss_i.transpose(0, 1)
 
-        return mean_loss.transpose(0, 1).contiguous()  # (bs, sp_seq)
+        return (total_loss / S).contiguous()  # (bs, sp_seq)
