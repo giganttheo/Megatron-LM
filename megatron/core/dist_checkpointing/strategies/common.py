@@ -42,9 +42,19 @@ def load_common(checkpoint_dir: str):
     try:
         if MultiStorageClientFeature.is_enabled():
             msc = MultiStorageClientFeature.import_package()
-            return msc.torch.load(load_path, map_location='cpu')
+            return msc.torch.load(load_path, map_location='cpu', weights_only=False)
         else:
-            return torch.load(load_path, map_location='cpu')
+            # weights_only=False: the common state dict intentionally pickles
+            # arbitrary Python objects from the full args namespace (e.g.
+            # signal.Signals enums from --exit-signal, dataclass configs,
+            # etc.), not just tensors. PyTorch >=2.6 defaults torch.load to
+            # weights_only=True, which rejects any global not on its
+            # tensor-safe allowlist (e.g. "Unsupported global:
+            # signal.SIGTERM") -- this checkpoint's common state was written
+            # by this same codebase, not an untrusted third party, so
+            # restoring the pre-2.6 default here is the same trust boundary
+            # the rest of checkpoint loading already assumes.
+            return torch.load(load_path, map_location='cpu', weights_only=False)
     except FileNotFoundError as e:
         err_msg = f'Common file {load_path} does not exist'
         if MultiStorageClientFeature.is_enabled():
